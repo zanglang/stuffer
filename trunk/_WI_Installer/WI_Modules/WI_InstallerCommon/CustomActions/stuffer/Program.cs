@@ -35,14 +35,14 @@ namespace stuffer
             }
 
             // backup the target exe to a temporary path
-            var original = Path.GetFullPath(args[1]);
-            var target = Path.Combine(Directory.GetParent(original).FullName, "test.exe");
-            File.Copy(original, target, true);
+            var target = Path.GetFullPath(args[1]);
+            var backup = Path.Combine(Directory.GetParent(target).FullName, Path.GetFileName(target) + ".orig");
+            File.Copy(target, backup, true);
 
             // load existing resources from original exe into memory
             var rc = new ResourceCollection();
-            rc.Find(original);
-            rc.Load(original);
+            rc.Find(backup);
+            rc.Load(backup);
 
             // if argument 1 was a .cab file instead of a directory
             if (File.Exists(args[0]))
