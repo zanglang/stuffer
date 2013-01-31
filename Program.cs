@@ -8,12 +8,14 @@
 namespace stuffer
 {
     using System;
-    using System.Diagnostics;
     using System.IO;
     using System.IO.Compression;
     using System.Linq;
+    using System.Threading.Tasks;
     using System.Xml.Serialization;
 
+    using Microsoft.Deployment.Compression;
+    using Microsoft.Deployment.Compression.Cab;
     using Microsoft.Deployment.Resources;
 
     /// <summary>
@@ -21,6 +23,8 @@ namespace stuffer
     /// </summary>
     public static class Program
     {
+        private static bool classicMode;
+
         /// <summary>
         /// Main program entry
         /// </summary>
@@ -28,46 +32,158 @@ namespace stuffer
         /// <returns>0 if successful, 1 for errors</returns>
         public static int Main(string[] args)
         {
-            if (args.Length != 2)
+            var sourcePath = string.Empty;
+            var targetExe = string.Empty;
+            var guid = string.Empty;
+
+            for (var i = 0; i < args.Length; i++)
             {
-                Console.WriteLine("Usage: stuffer <directory> <output EXE>");
-                return 1;
+                switch (args[i].ToUpper())
+                {
+                    case "-B":
+                    case "--PATH":
+                        if (args.Length > i + 1)
+                        {
+                            targetExe = args[++i];
+                        }
+                        break;
+
+                    case "-F":
+                    case "--FOLDER":
+                        if (args.Length > i + 1)
+                        {
+                            sourcePath = args[++i];
+                        }
+                        break;
+
+                    case "-C":
+                    case "--CAB":
+                        if (args.Length > i + 1)
+                        {
+                            sourcePath = args[++i];
+                        }
+                        break;
+
+                    case "-G":
+                    case "-GUID":
+                        if (args.Length > i + 1)
+                        {
+                            guid = args[++i];
+                        }
+                        break;
+
+                    case "--CLASSIC":
+                        classicMode = true;
+                        break;
+
+                    default:
+                        if (string.IsNullOrEmpty(sourcePath))
+                        {
+                            sourcePath = args[i];
+                            break;
+                        }
+                        
+                        if (string.IsNullOrEmpty(targetExe))
+                        {
+                            targetExe = args[i];
+                            break;
+                        }
+
+                        Console.WriteLine("Usage: stuffer <directory> <output EXE>");
+                        return 1;
+                }
+            }
+
+            // verify program arguments
+            if (string.IsNullOrEmpty(sourcePath) || (!Directory.Exists(sourcePath) && !File.Exists(sourcePath))
+                || (File.Exists(sourcePath) && (Path.GetExtension(sourcePath) ?? "").ToLower() != ".cab"))
+            {
+                throw new ArgumentException("Source must either be a valid directory or .CAB file!");
+            }
+
+            if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe)
+                || (Path.GetExtension(targetExe) ?? "").ToLower() != ".exe")
+            {
+                throw new ArgumentException("Target must be a valid EXE!");
             }
 
             // backup the target exe to a temporary path
-            var target = Path.GetFullPath(args[1]);
-            var backup = Path.Combine(Directory.GetParent(target).FullName, Path.GetFileName(target) + ".orig");
-            File.Copy(target, backup, true);
+            targetExe = Path.GetFullPath(targetExe);
+            var backup = Path.Combine(Directory.GetParent(targetExe).FullName, Path.GetFileName(targetExe) + ".orig");
+            File.Copy(targetExe, backup, true);
 
-            // load existing resources from original exe into memory
-            var rc = new ResourceCollection();
-            rc.Find(backup);
-            rc.Load(backup);
-
-            // if argument 1 was a .cab file instead of a directory
-            if (File.Exists(args[0]))
+            if (!string.IsNullOrEmpty(guid))
             {
-                var extension = Path.GetExtension(args[0]);
-                Debug.Assert(extension != null);
-                if (extension.ToLower() != ".cab")
+                Console.WriteLine("Writing GUIDs is not supported yet.");
+            }
+
+            if (classicMode)
+            {
+                // create a cab file
+                var path = Path.GetFullPath("Product.cab");
+                if (File.Exists(path))
                 {
-                    Console.WriteLine("Only cabs are supported: {0}", args[0]);
-                    return 1;
+                    File.Delete(path);
                 }
 
-                EmbedCab(args[0], target);
-            }
-            else if (!Directory.Exists(args[0]))
-            {
-                Console.WriteLine("{0} must be directory or .cab file!", args[0]);
-                return 1;
+                Console.WriteLine("Compressing {0} to {1}...", sourcePath, path);
+                sourcePath = CompressCab(sourcePath, path);
             }
 
-            //////////////////////////////////
+            // if argument 1 was a .cab file instead of a directory
+            if (File.Exists(sourcePath))
+            {
+                EmbedCab(sourcePath, targetExe);
+            }
+            else
+            {
+                EmbedDirectory(sourcePath, targetExe);
+            }
+
+            return 0;
+        }
+
+        /// <summary>
+        /// Recursively iterate over a directory's contents and pack each file into a Windows Cabinet.
+        /// </summary>
+        /// <param name="directory">The source directory to iterate</param>
+        /// <param name="cabName">The filename of the Windows Cabinet</param>
+        /// <returns>The filesystem path of the packed Windows Cabinet</returns>
+        private static string CompressCab(string directory, string cabName = "Product.cab")
+        {
+            var path = Path.GetFullPath(cabName);
+            var cab = new CabInfo(path);
+            cab.Pack(directory, true, CompressionLevel.Max, (sender, args) =>
+                {
+                    switch (args.ProgressType)
+                    {
+                        case ArchiveProgressType.FinishFile:
+                            Console.WriteLine("File: {0}", args.CurrentFileName);
+                            break;
+                        case ArchiveProgressType.FinishArchive:
+                            Console.WriteLine("Finished packing {0:N1}kB.", args.FileBytesProcessed);
+                            break;
+                    }
+                });
+            return path;
+        }
+
+        /// <summary>
+        /// Recursively iterate over a directory's contents and add each file as a <code>CabResource</code>
+        /// in the target Win32 PE file.
+        /// </summary>
+        /// <param name="directory">The source directory to iterate</param>
+        /// <param name="target">PE file to embed cab with</param>
+        private static void EmbedDirectory(string directory, string target)
+        {
+            // load existing resources from original exe into memory
+            var rc = new ResourceCollection();
+            rc.Find(target);
+            rc.Load(target);
 
             // generate list of all files in directory tree
-            var root = Path.GetFullPath(args[0]).TrimEnd(new[] { '\\' });
-            var query = from file in Directory.EnumerateFiles(args[0], "*.*", SearchOption.AllDirectories)
+            var root = Path.GetFullPath(directory).TrimEnd(new[] { '\\' });
+            var query = from file in Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories)
                         select Path.GetFullPath(file).Substring(root.Length + 1);
             var fileList = query.ToList();
 
@@ -86,37 +202,45 @@ namespace stuffer
                 rc.Add(new CabResource(@"FileList.xml", ref data));
             }
 
+            // read and compress files in parallel to be embedded
             long compressed = 0;
             long total = 0;
-            foreach (var file in fileList)
-            {
-                using (var filestream = File.OpenRead(Path.Combine(root, file)))
-                using (var mem = new MemoryStream())
-                {
-                    // read and compress files
-                    using (var gzip = new GZipStream(mem, CompressionMode.Compress, true))
+            Action<CabResource> addResource = rc.Add;
+            Parallel.ForEach(
+                fileList,
+                file =>
                     {
-                        filestream.CopyTo(gzip);
-                    }
+                        using (var filestream = File.OpenRead(Path.Combine(root, file)))
+                        using (var mem = new MemoryStream())
+                        {
+                            // compress files with Gzip in 8k blocks
+                            using (var gzip = new GZipStream(mem, CompressionMode.Compress, true))
+                            using (var buffered = new BufferedStream(gzip, 8192))
+                            {
+                                filestream.CopyTo(buffered);
+                            }
 
-                    total += filestream.Length;
-                    compressed += mem.Length;
-                    Console.WriteLine(
-                        "Compressed {0} - {1:N1}kB to {2:N1}kB.",
-                        file,
-                        filestream.Length / 1024f,
-                        mem.Length / 1024f);
-                    var data = mem.GetBuffer();
-                    rc.Add(new CabResource(file, ref data));
-                }
-            }
+                            // create new CabResource with compressed byte data
+                            lock (fileList)
+                            {
+                                total += filestream.Length;
+                                compressed += mem.Length;
+                                Console.WriteLine(
+                                    "Compressed {0} - {1:N1}kB to {2:N1}kB.",
+                                    file,
+                                    filestream.Length / 1024f,
+                                    mem.Length / 1024f);
+                                var data = mem.GetBuffer();
+                                addResource(new CabResource(file, ref data));
+                            }
+                        }
+                    });
 
             Console.WriteLine(
                 "Total: {0:N2}MB Compressed: {1:N2}MB. Saving...",
                 total / 1024f / 1024f,
                 compressed / 1024f / 1024f);
             rc.Save(target);
-            return 0;
         }
 
         /// <summary>
@@ -126,11 +250,8 @@ namespace stuffer
         /// <param name="target">PE file to embed cab with</param>
         private static void EmbedCab(string cabFile, string target)
         {
-            // read to bytes
-            byte[] cabData = File.ReadAllBytes(Path.GetFullPath(cabFile));
-
-            // save resources back to exe
-            var r = new CabResource("6699", ref cabData);
+            // load existing resources from original exe into memory
+            var r = new CabResource("#6699", cabFile);
             r.Save(target);
         }
     }
